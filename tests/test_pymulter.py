@@ -10,6 +10,32 @@ def test_parse_boundary():
     boundary = pymulter.parse_boundary(header)
     assert boundary == "----WebKitFormBoundary7MA4YWxkTrZu0gW"
 
+def test_parse_boundary_invalid():
+    # No boundary parameter
+    header = "multipart/form-data"
+    with pytest.raises(ValueError, match="multipart boundary not found in Content-Type"):
+        pymulter.parse_boundary(header)
+
+    # Empty boundary
+    header = "multipart/form-data; boundary="
+    boundary = pymulter.parse_boundary(header)
+    assert boundary == ""
+
+    # Malformed header
+    header = "multipart/form-data; boundary"
+    with pytest.raises(ValueError, match='failed to decode Content-Type'):
+        pymulter.parse_boundary(header)
+
+    # Not a multipart header
+    header = "application/json"
+    with pytest.raises(ValueError, match='Content-Type is not multipart/form-data'):
+        pymulter.parse_boundary(header)
+
+    # Boundary with only whitespace
+    header = "multipart/form-data; boundary=   "
+    with pytest.raises(ValueError, match='failed to decode Content-Type'):
+        pymulter.parse_boundary(header)
+
 
 # ---------- Test SizeLimitWrapper ----------
 def test_size_limit_wrapper():
@@ -72,6 +98,7 @@ async def test_multipart_parser_and_field():
 
     # Ambil field pertama
     field = await parser.next_field()
+    assert field
     assert field.name == "file"
     assert field.filename == "hello.txt"
     assert field.content_type == "text/plain"
@@ -88,6 +115,7 @@ async def test_multipart_parser_and_field():
 
     # Ambil field kedua
     field2 = await parser.next_field()
+    assert field2
     assert field2.name == "desc"
     assert field2.filename is None
     assert field2.content_type is None
@@ -118,6 +146,7 @@ async def test_multipart_parser_large_file():
     await parser.close()
 
     field = await parser.next_field()
+    assert field
     assert field.name == "bigfile"
     assert field.filename == "big.txt"
     assert field.content_type == "application/octet-stream"
@@ -150,6 +179,7 @@ async def test_multipart_parser_with_constraint():
 
     # First field is allowed
     field = await parser.next_field()
+    assert field
     assert field.name == "allowed"
     data = b""
     async for chunk in field:
@@ -178,6 +208,7 @@ async def test_multipart_parser_with_size_limit():
 
     # First field is within limit
     field = await parser.next_field()
+    assert field
     assert field.name == "f1"
     data = b""
     async for chunk in field:
@@ -185,6 +216,7 @@ async def test_multipart_parser_with_size_limit():
     assert data == b"12345"
 
     field = await parser.next_field()
+    assert field
     assert field.name == "f2"
     data = b""
     with pytest.raises(RuntimeError, match='field "f2" exceeded the size limit: 6 bytes'):
