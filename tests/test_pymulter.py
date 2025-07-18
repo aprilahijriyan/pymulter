@@ -96,9 +96,9 @@ async def test_multipart_parser_and_field():
         data2 += bytes(chunk)
     assert data2 == b"A file upload"
 
-    # Habis, next_field harus error
-    with pytest.raises(RuntimeError):
-        await parser.next_field()
+    # Habis, next_field harus nya None
+    field3 = await parser.next_field()
+    assert field3 is None
 
 
 @pytest.mark.asyncio
@@ -128,9 +128,9 @@ async def test_multipart_parser_large_file():
         data += bytes(chunk)
     assert data == large_content
 
-    # Habis, next_field harus error
-    with pytest.raises(RuntimeError):
-        await parser.next_field()
+    # Habis, next_field harus nya None
+    field2 = await parser.next_field()
+    assert field2 is None
 
 # Test parser with constraint (allowed_fields and size_limit)
 @pytest.mark.asyncio
@@ -157,7 +157,7 @@ async def test_multipart_parser_with_constraint():
     assert data == b"abc"
 
     # Second field is not allowed, should raise error
-    with pytest.raises(ValueError, match='unknown field received: "notallowed"'):
+    with pytest.raises(RuntimeError, match='unknown field received: "notallowed"'):
         await parser.next_field()
 
 @pytest.mark.asyncio
@@ -184,9 +184,9 @@ async def test_multipart_parser_with_size_limit():
         data += bytes(chunk)
     assert data == b"12345"
 
-    # Second field exceeds limit, should raise error
-    # with pytest.raises(RuntimeError):
     field = await parser.next_field()
-    print(field)
-    field = await parser.next_field()
-    print(field)
+    assert field.name == "f2"
+    data = b""
+    with pytest.raises(RuntimeError, match='field "f2" exceeded the size limit: 6 bytes'):
+        async for chunk in field:
+            data += bytes(chunk)

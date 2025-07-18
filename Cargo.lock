@@ -273,6 +273,7 @@ dependencies = [
  "memchr",
  "mime",
  "spin",
+ "tokio",
  "version_check",
 ]
 

@@ -81,8 +81,8 @@ impl SizeLimitWrapper {
         if let Some(pf) = self.per_field {
             sl = sl.per_field(pf);
         }
-        for (f, l) in &self.fields {
-            sl = sl.for_field(f, *l);
+        for (f, l) in self.fields.clone() {
+            sl = sl.for_field(f, l);
         }
         sl
     }
@@ -204,12 +204,13 @@ impl MultipartParser {
     pub fn feed<'py>(&self, data: &Bound<'py, PyBytes>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
         let bytes = Bytes::copy_from_slice(data.as_bytes());
+        let len = bytes.len();
         future_into_py(py, async move {
             let tx = tx.lock().await;
             if let Some(ref tx) = *tx {
                 tx.unbounded_send(bytes)
                     .map_err(|e| PyRuntimeError::new_err(format!("Feed error: {e}")))?;
-                Ok(())
+                Ok(len)
             } else {
                 Err(PyRuntimeError::new_err("Parser already closed"))
             }
@@ -248,14 +249,20 @@ impl MultipartParser {
     ) -> PyResult<Bound<'py, PyAny>> {
         let multipart = slf.multipart.clone();
         future_into_py(py, async move {
-            let mut guard = multipart.lock().await;
-            if guard.is_none() {
-                return Ok(None)
-            }
-            if let Some(mut multipart_instance) = guard.take() {
-                match multipart_instance.next_field().await {
+            // Ambil instance multipart dari Option, lalu lepas lock
+            let multipart_instance_opt = {
+                let mut guard = multipart.lock().await;
+                guard.take()
+            };
+            if let Some(mut multipart_instance) = multipart_instance_opt {
+                let next = multipart_instance.next_field().await;
+                match next {
                     Ok(Some(field)) => {
-                        *guard = Some(multipart_instance);
+                        // Proses field seperti biasa
+                        {
+                            let mut guard = multipart.lock().await;
+                            *guard = Some(multipart_instance);
+                        }
                         let name = field.name().map(|s| s.to_owned());
                         let filename = field.file_name().map(|s| s.to_owned());
                         let content_type = field.content_type().map(|m| m.to_string().to_owned());
@@ -281,11 +288,17 @@ impl MultipartParser {
                         })?;
                         Ok(Some(py_field))
                     }
-                    Ok(None) => Err(PyRuntimeError::new_err("Multipart parser exhausted")),
-                    Err(e) => Err(PyValueError::new_err(e.to_string())),
+                    Ok(None) => {
+                        // Tidak ada field lagi
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        // Tangani error
+                        Err(PyRuntimeError::new_err(format!("{e}")))
+                    }
                 }
             } else {
-                Err(PyRuntimeError::new_err("Multipart parser exhausted"))
+                Ok(None)
             }
         })
     }
@@ -375,4 +388,46 @@ fn pymulter(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MultipartField>()?;
     m.add_function(wrap_pyfunction!(py_parse_boundary, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_size_limit_wrapper_to_size_limit() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("file".to_string(), 500u64);
+        let wrapper = SizeLimitWrapper {
+            whole_stream: Some(1000),
+            per_field: Some(100),
+            fields,
+        };
+        let sl = wrapper.to_size_limit();
+        // SizeLimit tidak expose field, tapi kita bisa cek via debug
+        let debug = format!("{:?}", sl);
+        // println!("{}", debug);
+        assert!(debug.contains("whole_stream: 1000"));
+        assert!(debug.contains("per_field: 100"));
+        assert!(debug.contains("field_map: {\"file\": 500}"));
+    }
+
+    #[test]
+    fn test_constraint_wrapper_to_constraints() {
+        let size_limit = SizeLimitWrapper {
+            whole_stream: Some(1000),
+            per_field: Some(100),
+            fields: std::collections::HashMap::new(),
+        };
+        let wrapper = ConstraintWrapper {
+            size_limit: Some(size_limit.clone()),
+            allowed_fields: vec!["file".to_string(), "desc".to_string()],
+        };
+        let cons = wrapper.to_constraints();
+        let debug = format!("{:?}", cons);
+        // println!("{}", debug);
+        assert!(debug.contains("whole_stream: 1000"));
+        assert!(debug.contains("per_field: 100"));
+        assert!(debug.contains("allowed_fields: Some([\"file\", \"desc\"])"));
+    }
 }
