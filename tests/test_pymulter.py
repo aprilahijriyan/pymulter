@@ -222,3 +222,22 @@ async def test_multipart_parser_with_size_limit():
     with pytest.raises(RuntimeError, match='field "f2" exceeded the size limit: 6 bytes'):
         async for chunk in field:
             data += bytes(chunk)
+
+@pytest.mark.asyncio
+async def test_bad_example():
+    boundary = "minimal"
+    fields = [
+        ("foo", None, None, b"bar"),
+        ("bar", None, None, b"foo"),
+    ]
+    body = make_multipart_body(boundary, fields)
+    parser = pymulter.MultipartParser(boundary)
+    await parser.feed(body)
+    await parser.close()
+
+    field = await parser.next_field()
+    assert field
+    assert field.name == "foo"
+    # see: https://github.com/aprilahijriyan/pymulter/issues/2
+    with pytest.raises(RuntimeError, match='failed to lock multipart state'):
+        await parser.next_field()
