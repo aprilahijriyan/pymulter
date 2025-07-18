@@ -24,14 +24,6 @@ pip install pymulter
 uv add pymulter
 ```
 
-Install from local source:
-
-```bash
-pip install .
-# or
-uv pip install .
-```
-
 For development (editable mode), use:
 
 ```bash
