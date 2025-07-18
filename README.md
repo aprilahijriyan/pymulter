@@ -2,6 +2,10 @@
 
 `pymulter` is a Python binding for the Rust library [multer](https://github.com/rwf2/multer).
 
+> **Note:**  
+> This module was created with the help of AI tools to bridge between Python and Rust.  
+> I'm not a Rust developer, so feedback and contributions are appreciated!
+
 ## Features
 
 - **Async Streaming Multipart Parsing**: Efficiently parse multipart form data in a streaming fashion, suitable for large file uploads.
