@@ -237,7 +237,8 @@ impl MultipartParser {
                 Some(c) => Multipart::with_constraints(stream, &boundary, c),
                 None => Multipart::new(stream, &boundary),
             };
-            *multipart.lock().await = Some(mp);
+            let mut guard = multipart.lock().await;
+            *guard = Some(mp);
             Ok(true)
         })
     }
@@ -249,20 +250,12 @@ impl MultipartParser {
     ) -> PyResult<Bound<'py, PyAny>> {
         let multipart = slf.multipart.clone();
         future_into_py(py, async move {
-            // Ambil instance multipart dari Option, lalu lepas lock
-            let multipart_instance_opt = {
-                let mut guard = multipart.lock().await;
-                guard.take()
-            };
-            if let Some(mut multipart_instance) = multipart_instance_opt {
+            // Ambil instance multipart dari Option, tanpa take
+            let mut guard = multipart.lock().await;
+            if let Some(multipart_instance) = guard.as_mut() {
                 let next = multipart_instance.next_field().await;
                 match next {
                     Ok(Some(field)) => {
-                        // Proses field seperti biasa
-                        {
-                            let mut guard = multipart.lock().await;
-                            *guard = Some(multipart_instance);
-                        }
                         let name = field.name().map(|s| s.to_owned());
                         let filename = field.file_name().map(|s| s.to_owned());
                         let content_type = field.content_type().map(|m| m.to_string().to_owned());
@@ -289,11 +282,9 @@ impl MultipartParser {
                         Ok(Some(py_field))
                     }
                     Ok(None) => {
-                        // Tidak ada field lagi
                         Ok(None)
                     }
                     Err(e) => {
-                        // Tangani error
                         Err(PyRuntimeError::new_err(format!("{e}")))
                     }
                 }
@@ -347,25 +338,20 @@ impl MultipartField {
     ) -> PyResult<Bound<'py, PyAny>> {
         let field = slf.field.clone();
         future_into_py(py, async move {
-            let field_opt = {
-                let mut guard = field.lock().await;
-                guard.take()
-            };
-            if let Some(mut field_instance) = field_opt {
-                match field_instance.chunk().await {
-                    Ok(Some(chunk)) => {
-                        // Kembalikan field ke Arc<Mutex<Option<...>>>
-                        {
-                            let mut guard = field.lock().await;
-                            *guard = Some(field_instance);
+            let mut guard = field.lock().await;
+            match guard.as_mut() {
+                Some(field_instance) => {
+                    match field_instance.chunk().await {
+                        Ok(Some(chunk)) => Ok(Some(chunk.to_vec())),
+                        Ok(None) => {
+                            // Jika sudah habis, set None agar next iterasi return StopAsyncIteration
+                            *guard = None;
+                            Err(PyStopAsyncIteration::new_err("No more chunks"))
                         }
-                        Ok(Some(chunk.to_vec().to_owned()))
+                        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
                     }
-                    Ok(None) => Err(PyStopAsyncIteration::new_err("No more chunks")),
-                    Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
                 }
-            } else {
-                Err(PyStopAsyncIteration::new_err("No more chunks"))
+                None => Err(PyStopAsyncIteration::new_err("No more chunks")),
             }
         })
     }
