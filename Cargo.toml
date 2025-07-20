@@ -1,6 +1,6 @@
 [package]
 name = "pymulter"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Python bindings for Rust multer library"
 authors = ["Aprila Hijriyan <april@kuli.dev>"]
@@ -9,9 +9,20 @@ authors = ["Aprila Hijriyan <april@kuli.dev>"]
 pyo3 = { version = "0.25", features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.25", features = ["tokio-runtime"] }
 tokio = {version = "1.40", features = ["rt-multi-thread", "macros", "sync"]}
-multer = { version = "3.1.0", features = ["tokio"] }
+multer = "3.1.0"
 futures = "0.3"
 bytes = "1"
 
 [lib]
 crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

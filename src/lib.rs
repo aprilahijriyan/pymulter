@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use futures::{
-    channel::mpsc::{unbounded, UnboundedSender},
+    channel::mpsc::{unbounded, UnboundedSender, UnboundedReceiver},
     Stream,
 };
 use multer::{Constraints, Multipart, SizeLimit};
@@ -20,6 +20,19 @@ use tokio::sync::Mutex as AsyncMutex;
 
 /* ---------- SizeLimit ---------- */
 
+/// Configuration for size limits in multipart parsing.
+/// 
+/// This class allows you to set various size limits for multipart parsing:
+/// - whole_stream: Total size limit for the entire stream
+/// - per_field: Size limit for individual fields
+/// - fields: Size limits for specific field names
+/// 
+/// Example:
+///     size_limit = SizeLimit(
+///         whole_stream=1024*1024,  # 1MB total
+///         per_field=100*1024,      # 100KB per field
+///         fields={"file": 500*1024}  # 500KB for 'file' field
+///     )
 #[pyclass(name = "SizeLimit")]
 #[derive(Clone)]
 pub struct SizeLimitWrapper {
@@ -81,8 +94,8 @@ impl SizeLimitWrapper {
         if let Some(pf) = self.per_field {
             sl = sl.per_field(pf);
         }
-        for (f, l) in self.fields.clone() {
-            sl = sl.for_field(f, l);
+        for (f, l) in &self.fields {
+            sl = sl.for_field(f.clone(), *l);
         }
         sl
     }
@@ -90,6 +103,17 @@ impl SizeLimitWrapper {
 
 /* ---------- Constraint ---------- */
 
+/// Configuration for multipart parsing constraints.
+/// 
+/// This class allows you to set constraints for multipart parsing:
+/// - size_limit: Size limit configuration
+/// - allowed_fields: List of allowed field names
+/// 
+/// Example:
+///     constraint = Constraint(
+///         size_limit=SizeLimit(whole_stream=1024*1024),
+///         allowed_fields=["file", "description"]
+///     )
 #[pyclass(name = "Constraint")]
 #[derive(Clone)]
 pub struct ConstraintWrapper {
@@ -140,8 +164,7 @@ impl ConstraintWrapper {
             let v: Vec<Cow<'static, str>> = self
                 .allowed_fields
                 .iter()
-                .cloned()
-                .map(Cow::Owned)
+                .map(|s| Cow::Owned(s.clone()))
                 .collect();
             c = c.allowed_fields(v);
         }
@@ -152,7 +175,7 @@ impl ConstraintWrapper {
 /* ---------- Stream helper ---------- */
 
 pub struct ChunkStream {
-    rx: Arc<AsyncMutex<Option<futures::channel::mpsc::UnboundedReceiver<Bytes>>>>,
+    rx: Arc<AsyncMutex<UnboundedReceiver<Bytes>>>,
 }
 
 impl Stream for ChunkStream {
@@ -162,27 +185,43 @@ impl Stream for ChunkStream {
         // Coba dapatkan lock tanpa blocking
         match self.rx.try_lock() {
             Ok(mut guard) => {
-                if let Some(ref mut rx) = *guard {
-                    // Pin receiver dan poll
-                    Pin::new(rx).poll_next(cx).map(|opt| opt.map(Ok))
-                } else {
-                    Poll::Ready(None)
-                }
+                // Pin receiver dan poll
+                Pin::new(&mut *guard).poll_next(cx).map(|opt| opt.map(Ok))
             }
             Err(_) => Poll::Pending, // Jika tidak dapat lock, pending
         }
     }
 }
 
+/* ---------- Parser State ---------- */
+
+#[derive(Debug)]
+enum ParserState {
+    Active(UnboundedSender<Bytes>),
+    Closed,
+}
+
+#[derive(Debug)]
+enum MultipartState {
+    NotInitialized,
+    Active(Multipart<'static>),
+    Exhausted,
+}
+
 /* ---------- MultipartParser ---------- */
 
+/// A parser for multipart/form-data streams.
+/// 
+/// This class provides an interface to parse multipart/form-data streams
+/// asynchronously. It accepts raw bytes through the async `feed()` method and
+/// provides access to parsed fields through the async `next_field()` method.
 #[pyclass]
 pub struct MultipartParser {
-    tx: Arc<AsyncMutex<Option<UnboundedSender<Bytes>>>>,
-    rx: Arc<AsyncMutex<Option<futures::channel::mpsc::UnboundedReceiver<Bytes>>>>, // Tambahan rx
+    state: Arc<AsyncMutex<ParserState>>,
+    rx: Arc<AsyncMutex<UnboundedReceiver<Bytes>>>,
     boundary: String,
     constraints: Option<ConstraintWrapper>,
-    multipart: Arc<AsyncMutex<Option<Multipart<'static>>>>, // Persistent Multipart
+    multipart_state: Arc<AsyncMutex<MultipartState>>,
 }
 
 #[pymethods]
@@ -192,104 +231,150 @@ impl MultipartParser {
     pub fn new(_py: Python, boundary: &str, constraints: Option<ConstraintWrapper>) -> Self {
         let (tx, rx) = unbounded();
         MultipartParser {
-            tx: Arc::new(AsyncMutex::new(Some(tx))),
-            rx: Arc::new(AsyncMutex::new(Some(rx))),
+            state: Arc::new(AsyncMutex::new(ParserState::Active(tx))),
+            rx: Arc::new(AsyncMutex::new(rx)),
             boundary: boundary.to_owned(),
             constraints,
-            multipart: Arc::new(AsyncMutex::new(None)), // Belum dibuat di sini
+            multipart_state: Arc::new(AsyncMutex::new(MultipartState::NotInitialized)),
         }
     }
 
-    /// Feed raw bytes into the parser.
+    /// Feed raw bytes into the parser (async function).
+    /// 
+    /// This async method accepts raw bytes and sends them to the internal parser buffer.
+    /// The parser will accumulate these bytes until `close()` is called.
+    /// 
+    /// Args:
+    ///     data: Raw bytes to feed into the parser
+    /// 
+    /// Returns:
+    ///     Number of bytes successfully fed into the parser
+    /// 
+    /// Raises:
+    ///     RuntimeError: If the parser has already been closed
     pub fn feed<'py>(&self, data: &Bound<'py, PyBytes>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let tx = self.tx.clone();
+        let state = self.state.clone();
         let bytes = Bytes::copy_from_slice(data.as_bytes());
         let len = bytes.len();
         future_into_py(py, async move {
-            let tx = tx.lock().await;
-            if let Some(ref tx) = *tx {
-                tx.unbounded_send(bytes)
-                    .map_err(|e| PyRuntimeError::new_err(format!("Feed error: {e}")))?;
-                Ok(len)
-            } else {
-                Err(PyRuntimeError::new_err("Parser already closed"))
+            let mut guard = state.lock().await;
+            match &mut *guard {
+                ParserState::Active(tx) => {
+                    tx.unbounded_send(bytes)
+                        .map_err(|e| PyRuntimeError::new_err(format!("Feed error: {e}")))?;
+                    Ok(len)
+                }
+                ParserState::Closed => {
+                    Err(PyRuntimeError::new_err("Parser already closed"))
+                }
             }
         })
     }
 
-    /// Signal end-of-stream.
+    /// Signal end-of-stream and initialize the multipart parser (async function).
+    /// 
+    /// This async method closes the input stream and initializes the multipart parser
+    /// with the accumulated data. After calling this method, you can use
+    /// `next_field()` to iterate over the parsed fields.
+    /// 
+    /// Returns:
+    ///     True if the parser was successfully closed and initialized
+    /// 
+    /// Raises:
+    ///     RuntimeError: If the parser has already been closed
     pub fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let tx = self.tx.clone();
+        let state = self.state.clone();
         let rx = self.rx.clone();
         let boundary = self.boundary.clone();
         let constraints = self.constraints.clone();
-        let multipart = self.multipart.clone();
+        let multipart_state = self.multipart_state.clone();
         future_into_py(py, async move {
-            let mut tx_guard = tx.lock().await;
-            if tx_guard.is_none() {
+            // Close the sender
+            let mut state_guard = state.lock().await;
+            if let ParserState::Active(_) = *state_guard {
+                *state_guard = ParserState::Closed;
+            } else {
                 return Err(PyRuntimeError::new_err("Parser already closed"));
             }
-            tx_guard.take();
-            // Buat instance Multipart di sini
+            // Initialize multipart
             let stream = ChunkStream { rx };
             let cons = constraints.as_ref().map(|c| c.to_constraints());
             let mp = match cons {
                 Some(c) => Multipart::with_constraints(stream, &boundary, c),
                 None => Multipart::new(stream, &boundary),
             };
-            let mut guard = multipart.lock().await;
-            *guard = Some(mp);
+            
+            let mut mp_guard = multipart_state.lock().await;
+            *mp_guard = MultipartState::Active(mp);
+            drop(state_guard);
             Ok(true)
         })
     }
 
-    /// Async generator over fields.
+    /// Get the next field from the multipart data (async function).
+    /// 
+    /// This async method returns the next field from the parsed multipart data.
+    /// Each field contains metadata (name, filename, content_type, headers)
+    /// and can be iterated over to get the field's content as chunks.
+    /// 
+    /// Returns:
+    ///     The next field as a MultipartField object, or None if no more fields
+    /// 
+    /// Raises:
+    ///     RuntimeError: If the parser is not initialized (call close() first)
+    ///     RuntimeError: If there's an error parsing the multipart data
     pub fn next_field<'py>(
         slf: PyRefMut<'py, Self>,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let multipart = slf.multipart.clone();
+        let multipart_state = slf.multipart_state.clone();
         future_into_py(py, async move {
-            // Ambil instance multipart dari Option, tanpa take
-            let mut guard = multipart.lock().await;
-            if let Some(multipart_instance) = guard.as_mut() {
-                let next = multipart_instance.next_field().await;
-                match next {
-                    Ok(Some(field)) => {
-                        let name = field.name().map(|s| s.to_owned());
-                        let filename = field.file_name().map(|s| s.to_owned());
-                        let content_type = field.content_type().map(|m| m.to_string().to_owned());
-                        let headers = field
-                            .headers()
-                            .iter()
-                            .map(|(k, v)| {
-                                (
-                                    String::from_utf8_lossy(k.as_ref()).into_owned(),
-                                    String::from_utf8_lossy(v.as_ref()).into_owned(),
-                                )
-                            })
-                            .collect();
+            let mut guard = multipart_state.lock().await;
+            match &mut *guard {
+                MultipartState::Active(multipart_instance) => {
+                    let next = multipart_instance.next_field().await;
+                    match next {
+                        Ok(Some(field)) => {
+                            let name = field.name().map(|s| s.to_owned());
+                            let filename = field.file_name().map(|s| s.to_owned());
+                            let content_type = field.content_type().map(|m| m.to_string());
+                            let headers = field
+                                .headers()
+                                .iter()
+                                .map(|(k, v)| {
+                                    (
+                                        String::from_utf8_lossy(k.as_ref()).into_owned(),
+                                        String::from_utf8_lossy(v.as_ref()).into_owned(),
+                                    )
+                                })
+                                .collect();
 
-                        let py_field = Python::with_gil(|py| {
-                            Py::new(py, MultipartField {
-                                name,
-                                filename,
-                                content_type,
-                                headers,
-                                field: Arc::new(AsyncMutex::new(Some(field))),
-                            })
-                        })?;
-                        Ok(Some(py_field))
-                    }
-                    Ok(None) => {
-                        Ok(None)
-                    }
-                    Err(e) => {
-                        Err(PyRuntimeError::new_err(format!("{e}")))
+                            let py_field = Python::with_gil(|py| {
+                                Py::new(py, MultipartField {
+                                    name,
+                                    filename,
+                                    content_type,
+                                    headers,
+                                    field: Arc::new(AsyncMutex::new(Some(field))),
+                                })
+                            })?;
+                            Ok(Some(py_field))
+                        }
+                        Ok(None) => {
+                            *guard = MultipartState::Exhausted;
+                            Ok(None)
+                        }
+                        Err(e) => {
+                            Err(PyRuntimeError::new_err(format!("{e}")))
+                        }
                     }
                 }
-            } else {
-                Ok(None)
+                MultipartState::NotInitialized => {
+                    Err(PyRuntimeError::new_err("Parser not initialized. Call close() first."))
+                }
+                MultipartState::Exhausted => {
+                    Ok(None)
+                }
             }
         })
     }
@@ -297,6 +382,21 @@ impl MultipartParser {
 
 /* ---------- MultipartField ---------- */
 
+/// A field from a multipart/form-data stream.
+/// 
+/// This class represents a single field from a multipart/form-data stream.
+/// It contains metadata about the field and provides async iteration
+/// over the field's content chunks.
+/// 
+/// The field can be used in async for loops to iterate over its content:
+///     async for chunk in field:
+///         process_chunk(chunk)
+/// 
+/// Attributes:
+///     name: The field name
+///     filename: The filename if this is a file field
+///     content_type: The content type of the field
+///     headers: Additional headers for this field
 #[pyclass]
 pub struct MultipartField {
     name: Option<String>,
@@ -328,10 +428,26 @@ impl MultipartField {
         self.headers.clone()
     }
 
+    /// Make the field iterable for async iteration.
+    /// 
+    /// This method allows the field to be used in async for loops
+    /// to iterate over the field's content chunks.
+    /// Note: This is a synchronous method that returns an async iterator.
     pub fn __aiter__(slf: PyRefMut<'_, Self>) -> PyResult<Py<MultipartField>> {
         Ok(slf.into())
     }
 
+    /// Get the next chunk of field data (async function).
+    /// 
+    /// This async method returns the next chunk of data from the field.
+    /// When all chunks have been consumed, it raises StopAsyncIteration.
+    /// 
+    /// Returns:
+    ///     The next chunk as bytes, or raises StopAsyncIteration when done
+    /// 
+    /// Raises:
+    ///     StopAsyncIteration: When no more chunks are available
+    ///     RuntimeError: If there's an error reading the field data
     pub fn __anext__<'py>(
         slf: PyRefMut<'py, Self>,
         py: Python<'py>,
@@ -359,6 +475,19 @@ impl MultipartField {
 
 /* ---------- utility ---------- */
 
+/// Parse the boundary from a Content-Type header.
+/// 
+/// This function extracts the boundary parameter from a Content-Type header
+/// that contains multipart/form-data.
+/// 
+/// Args:
+///     header: The Content-Type header string
+/// 
+/// Returns:
+///     The boundary string
+/// 
+/// Raises:
+///     ValueError: If the header format is invalid
 #[pyfunction(name = "parse_boundary")]
 pub fn py_parse_boundary(header: &str) -> PyResult<Option<String>> {
     multer::parse_boundary(header)
